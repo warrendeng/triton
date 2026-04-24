@@ -1538,7 +1538,12 @@ public:
     ModuleOp m = getOperation();
     RewritePatternSet cleanUpPatterns(context);
     ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns, context);
-    if (applyPatternsGreedily(m, std::move(cleanUpPatterns)).failed()) {
+    // See final cleanup in runOnOperation for rationale on maxIterations.
+    GreedyRewriteConfig config;
+    config.setMaxIterations(64);
+    if (applyPatternsGreedily(m, std::move(cleanUpPatterns), config).failed()) {
+      m.emitError("greedy rewriter failed to converge in ")
+          << config.getMaxIterations() << " iterations";
       signalPassFailure();
     }
 
@@ -1600,7 +1605,14 @@ public:
     scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
-    if (applyPatternsGreedily(m, std::move(cleanUpPatterns2)).failed()) {
+    // MLIR's default maxIterations (10) is insufficient when this pass receives
+    // IR with >=10 unrolled scf.if regions carrying tensor values; bump to 64.
+    // See pytorch/pytorch#180908.
+    GreedyRewriteConfig config;
+    config.setMaxIterations(64);
+    if (applyPatternsGreedily(m, std::move(cleanUpPatterns2), config).failed()) {
+      m.emitError("greedy rewriter failed to converge in ")
+          << config.getMaxIterations() << " iterations";
       signalPassFailure();
     }
     LLVM_DEBUG({

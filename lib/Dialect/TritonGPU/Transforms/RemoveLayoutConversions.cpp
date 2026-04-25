@@ -1538,11 +1538,11 @@ public:
     ModuleOp m = getOperation();
     RewritePatternSet cleanUpPatterns(context);
     ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns, context);
-    // See final cleanup in runOnOperation for rationale on maxIterations.
+    // Bump from MLIR default (10); see final cleanup below for rationale.
     GreedyRewriteConfig config;
-    config.setMaxIterations(64);
+    config.setMaxIterations(32);
     if (applyPatternsGreedily(m, std::move(cleanUpPatterns), config).failed()) {
-      m.emitError("greedy rewriter failed to converge in ")
+      m.emitError("RemoveLayoutConversions: cleanup did not converge in ")
           << config.getMaxIterations() << " iterations";
       signalPassFailure();
     }
@@ -1605,13 +1605,16 @@ public:
     scf::ForOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     scf::IfOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
-    // MLIR's default maxIterations (10) is insufficient when this pass receives
-    // IR with >=10 unrolled scf.if regions carrying tensor values; bump to 64.
-    // See pytorch/pytorch#180908.
+    // The MLIR greedy rewriter default of maxIterations=10 is insufficient
+    // when this pass receives IR with ~10+ unrolled scf.if regions carrying
+    // tensor values (e.g. tl.static_range with a runtime guard). Empirically
+    // 20 iterations covers the affected range; bump to 32 for headroom while
+    // still catching genuine pattern-cycle bugs. See pytorch/pytorch#180908.
     GreedyRewriteConfig config;
-    config.setMaxIterations(64);
-    if (applyPatternsGreedily(m, std::move(cleanUpPatterns2), config).failed()) {
-      m.emitError("greedy rewriter failed to converge in ")
+    config.setMaxIterations(32);
+    if (applyPatternsGreedily(m, std::move(cleanUpPatterns2), config)
+            .failed()) {
+      m.emitError("RemoveLayoutConversions: final cleanup did not converge in ")
           << config.getMaxIterations() << " iterations";
       signalPassFailure();
     }

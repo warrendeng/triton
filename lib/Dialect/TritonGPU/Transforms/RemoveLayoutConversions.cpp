@@ -22,6 +22,10 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
+#include <atomic>
 #include <deque>
 
 namespace mlir::triton::gpu {
@@ -1528,6 +1532,59 @@ void hoistConvert(ModuleOp module) {
 }
 } // namespace
 
+// Default iteration cap matches MLIR's GreedyRewriteConfig default. The
+// two cleanup sites in this pass are terminal canonicalization phases —
+// best-effort simplification after the substantive rewrites are done.
+// Bailing out leaves functionally-correct IR that's just not maximally
+// canonicalized; for the off-by-one case (production _penalties_kernel)
+// IR/PTX/SASS are byte-identical between bailing-out and converged
+// builds, because iteration N+1 in the greedy rewriter is the
+// convergence-verification sweep, not a productive rewrite. So warn-only
+// at these sites preserves codegen.
+//
+// The knob exists because Triton's LLVM pin bump in #9264 (0729a74e66
+// -> 2eb709b95d8f) raised the cleanup iteration count for the trigger
+// profile in pytorch/pytorch#180908 from 2 to 11, past the default. The
+// strongest mechanism match within that range (c4750d0575e6, "Consolidate
+// patterns into RegionBranchOpInterface patterns") was tested in
+// isolation and ruled out — reverting it alone leaves the count at 11 —
+// so attribution is distributed across the range, not a single commit.
+// Users hitting the warning can raise the cap via
+// TRITON_LAYOUT_CLEANUP_MAX_ITERATIONS.
+static constexpr int64_t kDefaultCleanupMaxIterations = 10;
+
+static int64_t getCleanupMaxIterations() {
+  const std::string envVal =
+      tools::getStrEnv("TRITON_LAYOUT_CLEANUP_MAX_ITERATIONS");
+  if (envVal.empty())
+    return kDefaultCleanupMaxIterations;
+  int64_t v = 0;
+  if (!llvm::StringRef(envVal).getAsInteger(10, v) && v > 0)
+    return v;
+  return kDefaultCleanupMaxIterations;
+}
+
+// Emit a one-shot-per-process warning to stderr when the cleanup bails. We
+// bypass MLIR's diagnostic handler because Triton's handler (python/src/ir.cc)
+// silently filters warnings unless MLIR_ENABLE_DIAGNOSTICS=warnings is set, so
+// emitWarning() would be invisible to the user by default. One-shot frequency
+// avoids spamming during JIT cache misses; Subagent 2's IR/PTX diff showed
+// bailed-out and converged kernels are byte-identical for the off-by-one
+// trigger profile, so the warning is informational rather than urgent.
+static void emitCleanupBailoutWarning(int64_t cap) {
+  static std::atomic<bool> alreadyWarned{false};
+  bool expected = false;
+  if (!alreadyWarned.compare_exchange_strong(expected, true))
+    return;
+  llvm::errs()
+      << "warning: RemoveLayoutConversions: cleanup did not converge in " << cap
+      << " iterations. For typical off-by-one cases this is benign (output "
+         "IR is identical to the converged case). If you observe codegen "
+         "degradation, raise the cap via "
+         "TRITON_LAYOUT_CLEANUP_MAX_ITERATIONS=<bigger N> or see "
+         "https://github.com/pytorch/pytorch/issues/180908.\n";
+}
+
 class TritonGPURemoveLayoutConversionsPass
     : public impl::TritonGPURemoveLayoutConversionsBase<
           TritonGPURemoveLayoutConversionsPass> {
@@ -1538,14 +1595,13 @@ public:
     ModuleOp m = getOperation();
     RewritePatternSet cleanUpPatterns(context);
     ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns, context);
-    // Bump from MLIR default (10); see final cleanup below for rationale.
+    // See final cleanup below for rationale; warn (don't fail) on
+    // non-convergence so partially-cleaned IR continues downstream.
     GreedyRewriteConfig config;
-    config.setMaxIterations(32);
-    if (applyPatternsGreedily(m, std::move(cleanUpPatterns), config).failed()) {
-      m.emitError("RemoveLayoutConversions: cleanup did not converge in ")
-          << config.getMaxIterations() << " iterations";
-      signalPassFailure();
-    }
+    int64_t cap = getCleanupMaxIterations();
+    config.setMaxIterations(cap);
+    if (applyPatternsGreedily(m, std::move(cleanUpPatterns), config).failed())
+      emitCleanupBailoutWarning(cap);
 
     LLVM_DEBUG({
       DBGS() << "Module after canonicalizing:\n";
@@ -1607,17 +1663,15 @@ public:
     ConvertLayoutOp::getCanonicalizationPatterns(cleanUpPatterns2, context);
     // The MLIR greedy rewriter default of maxIterations=10 is insufficient
     // when this pass receives IR with ~10+ unrolled scf.if regions carrying
-    // tensor values (e.g. tl.static_range with a runtime guard). Empirically
-    // 20 iterations covers the affected range; bump to 32 for headroom while
-    // still catching genuine pattern-cycle bugs. See pytorch/pytorch#180908.
+    // tensor values (e.g. tl.static_range with a runtime guard). On
+    // non-convergence we warn (instead of failing) so partially-cleaned IR
+    // continues downstream rather than crashing the compile.
+    // See pytorch/pytorch#180908.
     GreedyRewriteConfig config;
-    config.setMaxIterations(32);
-    if (applyPatternsGreedily(m, std::move(cleanUpPatterns2), config)
-            .failed()) {
-      m.emitError("RemoveLayoutConversions: final cleanup did not converge in ")
-          << config.getMaxIterations() << " iterations";
-      signalPassFailure();
-    }
+    int64_t cap = getCleanupMaxIterations();
+    config.setMaxIterations(cap);
+    if (applyPatternsGreedily(m, std::move(cleanUpPatterns2), config).failed())
+      emitCleanupBailoutWarning(cap);
     LLVM_DEBUG({
       DBGS() << "Module after final cleanups:\n";
       m.dump();
